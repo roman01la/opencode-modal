@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+$pwa_head
+<title>OpenPortal — Login</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #0a0a0a; color: #e5e5e5;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  .card {
+    background: #171717; border: 1px solid #262626; border-radius: 12px;
+    padding: 2.5rem; width: 100%; max-width: 380px;
+  }
+  h1 { font-size: 1.25rem; margin-bottom: 1.5rem; text-align: center; }
+  input[type="password"] {
+    width: 100%; padding: 0.7rem 1rem; border: 1px solid #333;
+    border-radius: 8px; background: #0a0a0a; color: #e5e5e5;
+    font-size: 0.95rem; outline: none; margin-bottom: 1rem;
+  }
+  input[type="password"]:focus { border-color: #555; }
+  button {
+    width: 100%; padding: 0.7rem; border: none; border-radius: 8px;
+    background: #e5e5e5; color: #0a0a0a; font-size: 0.95rem;
+    font-weight: 600; cursor: pointer;
+  }
+  button:hover { background: #d4d4d4; }
+  .error {
+    color: #ef4444; font-size: 0.85rem; margin-bottom: 1rem; text-align: center;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>OpenPortal</h1>
+  $error
+  <form method="POST" action="/login">
+    <input type="password" name="password" placeholder="Password" autofocus required>
+    <button type="submit">Sign in</button>
+  </form>
+</div>
+</body>
+</html>

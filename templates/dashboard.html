@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+$pwa_head
+<title>OpenPortal — Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #0a0a0a; color: #e5e5e5;
+    min-height: 100vh;
+    padding: max(1rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right)) max(1rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
+  }
+  .container { max-width: 720px; margin: 0 auto; }
+  .header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 1.5rem;
+  }
+  h1 { font-size: 1.25rem; }
+  .sandbox-card {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 0.75rem 0; border-bottom: 1px solid #1a1a1a;
+    gap: 0.75rem;
+  }
+  .sandbox-card:first-child { border-top: 1px solid #262626; }
+  .sandbox-card:hover { background: #171717; }
+  .sandbox-info { min-width: 0; flex: 1; }
+  .sandbox-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sandbox-meta { font-size: 0.8rem; color: #737373; margin-top: 0.2rem; }
+  .sandbox-actions { display: flex; gap: 0.4rem; flex-shrink: 0; }
+  .btn {
+    display: inline-block; padding: 0.4rem 0.9rem; border-radius: 6px;
+    font-size: 0.8rem; font-weight: 600; text-decoration: none;
+    cursor: pointer; border: none; white-space: nowrap;
+  }
+  .btn-primary { background: #e5e5e5; color: #0a0a0a; }
+  .btn-primary:hover { background: #d4d4d4; }
+  .btn-secondary { background: #262626; color: #e5e5e5; }
+  .btn-secondary:hover { background: #333; }
+  .btn-danger { background: #7f1d1d; color: #fca5a5; }
+  .btn-danger:hover { background: #991b1b; }
+  .create-form {
+    margin-top: 1.5rem; border-top: 1px solid #262626; padding-top: 1.5rem;
+  }
+  .create-form .row {
+    display: flex; gap: 0.75rem; margin-bottom: 0.75rem; flex-wrap: wrap;
+  }
+  .create-form input, .create-form select {
+    padding: 0.6rem 1rem; border: 1px solid #333;
+    border-radius: 8px; background: #0a0a0a; color: #e5e5e5;
+    font-size: 0.9rem; outline: none;
+  }
+  .create-form input { flex: 1; min-width: 0; }
+  .create-form input:focus, .create-form select:focus { border-color: #555; }
+  .create-form label {
+    font-size: 0.75rem; color: #737373; display: block; margin-bottom: 0.3rem;
+  }
+  .create-form .field { display: flex; flex-direction: column; }
+  .create-form .field-grow { flex: 1; min-width: 0; }
+  @media (max-width: 500px) {
+    .sandbox-card { flex-direction: column; align-items: flex-start; }
+    .sandbox-actions { margin-top: 0.5rem; }
+    .create-form .row { flex-direction: column; }
+    .create-form select { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>OpenPortal</h1>
+    <form method="POST" action="/logout">
+      <button type="submit" class="btn btn-secondary">Logout</button>
+    </form>
+  </div>
+
+  $sandbox_list
+
+  <form class="create-form" method="POST" action="/sandboxes">
+    <div class="row">
+      <div class="field field-grow">
+        <label>Name</label>
+        <input type="text" name="name" placeholder="New sandbox name..." required>
+      </div>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label>CPU</label>
+        <select name="cpu">
+          <option value="0.5" selected>0.5</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="4">4</option>
+          <option value="8">8</option>
+          <option value="16">16</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>RAM (MB)</label>
+        <select name="memory">
+          <option value="512" selected>512</option>
+          <option value="1024">1024</option>
+          <option value="2048">2048</option>
+          <option value="4096">4096</option>
+          <option value="8192">8192</option>
+          <option value="16384">16384</option>
+          <option value="32768">32768</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>GPU</label>
+        <select name="gpu_type" id="gpu_type" onchange="document.getElementById('gpu_count_field').style.display=this.value?'flex':'none'">
+          <option value="">None</option>
+          <option value="T4">T4</option>
+          <option value="L4">L4</option>
+          <option value="A10G">A10G</option>
+          <option value="L40S">L40S</option>
+          <option value="A100">A100</option>
+          <option value="H100">H100</option>
+        </select>
+      </div>
+      <div class="field" id="gpu_count_field" style="display:none">
+        <label>GPU Count</label>
+        <select name="gpu_count">
+          <option value="1" selected>1</option>
+          <option value="2">2</option>
+          <option value="4">4</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <button type="submit" class="btn btn-primary">Create Sandbox</button>
+    </div>
+  </form>
+</div>
+</body>
+</html>

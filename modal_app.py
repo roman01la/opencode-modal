@@ -27,6 +27,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+from string import Template
 
 import modal
 
@@ -81,7 +82,13 @@ def _build_sandbox_image() -> modal.Image:
 sandbox_image = _build_sandbox_image()
 
 # Proxy image — lightweight, only needs fastapi.
-proxy_image = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi")
+proxy_image = modal.Image.debian_slim(python_version="3.12").pip_install(
+    "fastapi"
+).add_local_dir(
+    str(Path(__file__).parent / "templates"),
+    "/root/templates",
+    copy=True,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -139,14 +146,16 @@ ln -sfn {workspace_dir}/.opencode-data /root/.local/share/opencode
 if [ ! -d {workspace_dir}/.git ]; then
     git init {workspace_dir}
 fi
+# Periodically sync volume to persist data while running.
+while true; do sleep 60; sync {VOLUME_MOUNT}; done &
 exec opencode serve --hostname=0.0.0.0 --port={OPENCODE_PORT}
 """
 
 
 def _create_sandbox(
     name: str,
-    cpu: float = 4.0,
-    memory: int = 8192,
+    cpu: float = 0.5,
+    memory: int = 512,
     gpu_type: str = "",
     gpu_count: int = 0,
 ) -> dict:
@@ -212,13 +221,22 @@ def _get_running_sandbox(entry: dict) -> modal.Sandbox | None:
     return None
 
 
+def _sync_and_terminate(sb: modal.Sandbox) -> None:
+    """Flush volume writes and terminate a running sandbox."""
+    try:
+        sb.exec("sync", VOLUME_MOUNT)
+    except Exception:
+        pass
+    sb.terminate()
+
+
 def _start_sandbox(entry: dict) -> dict:
     """Start a new sandbox container for an existing registry entry."""
     # Ensure the old sandbox is fully terminated before reusing the name.
     try:
         old_sb = modal.Sandbox.from_id(entry["modal_sandbox_id"])
         if old_sb.poll() is None:
-            old_sb.terminate()
+            _sync_and_terminate(old_sb)
     except Exception:
         pass
 
@@ -264,11 +282,11 @@ def _start_sandbox(entry: dict) -> dict:
 
 def _delete_sandbox(entry: dict) -> None:
     """Delete a sandbox: terminate it, remove its workspace, and unregister."""
-    # Terminate if still running.
+    # Sync and terminate if still running.
     try:
         sb = modal.Sandbox.from_id(entry["modal_sandbox_id"])
         if sb.poll() is None:
-            sb.terminate()
+            _sync_and_terminate(sb)
     except Exception:
         pass
 
@@ -308,234 +326,94 @@ def _check_token(token: str) -> bool:
 # ---------------------------------------------------------------------------
 # HTML templates
 # ---------------------------------------------------------------------------
-LOGIN_PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OpenPortal — Login</title>
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: system-ui, -apple-system, sans-serif;
-    background: #0a0a0a; color: #e5e5e5;
-    display: flex; align-items: center; justify-content: center;
-    min-height: 100vh;
-  }
-  .card {
-    background: #171717; border: 1px solid #262626; border-radius: 12px;
-    padding: 2.5rem; width: 100%; max-width: 380px;
-  }
-  h1 { font-size: 1.25rem; margin-bottom: 1.5rem; text-align: center; }
-  input[type="password"] {
-    width: 100%; padding: 0.7rem 1rem; border: 1px solid #333;
-    border-radius: 8px; background: #0a0a0a; color: #e5e5e5;
-    font-size: 0.95rem; outline: none; margin-bottom: 1rem;
-  }
-  input[type="password"]:focus { border-color: #555; }
-  button {
-    width: 100%; padding: 0.7rem; border: none; border-radius: 8px;
-    background: #e5e5e5; color: #0a0a0a; font-size: 0.95rem;
-    font-weight: 600; cursor: pointer;
-  }
-  button:hover { background: #d4d4d4; }
-  .error {
-    color: #ef4444; font-size: 0.85rem; margin-bottom: 1rem; text-align: center;
-  }
-</style>
-</head>
-<body>
-<div class="card">
-  <h1>OpenPortal</h1>
-  {error}
-  <form method="POST" action="/login">
-    <input type="password" name="password" placeholder="Password" autofocus required>
-    <button type="submit">Sign in</button>
-  </form>
-</div>
-</body>
-</html>"""
+# Use the container path if available (Modal deploys templates there),
+# otherwise fall back to the local path next to modal_app.py.
+_CONTAINER_TEMPLATES = Path("/root/templates")
+_LOCAL_TEMPLATES = Path(__file__).parent / "templates"
+TEMPLATES_DIR = _CONTAINER_TEMPLATES if _CONTAINER_TEMPLATES.is_dir() else _LOCAL_TEMPLATES
+
+
+def _load_template(name: str) -> Template:
+    """Load an HTML template from the templates/ directory."""
+    return Template((TEMPLATES_DIR / name).read_text())
+
+
+# Pre-load shared partial.
+_PWA_HEAD = (TEMPLATES_DIR / "head.html").read_text()
+
+
+def _render_login_page(error: str = "") -> str:
+    """Render the login page template."""
+    return _load_template("login.html").safe_substitute(
+        pwa_head=_PWA_HEAD, error=error
+    )
+
+
+def _render_sandbox_card(s: dict) -> str:
+    """Render a single sandbox card HTML fragment."""
+    status = s["status"]
+    status_dot = (
+        '<span style="color:#22c55e">&#9679;</span>'
+        if status == "running"
+        else '<span style="color:#737373">&#9679;</span>'
+    )
+
+    # Resource summary
+    cpu = s.get("cpu", 4)
+    mem = s.get("memory", 8192)
+    gpu_type = s.get("gpu_type", "")
+    gpu_count = s.get("gpu_count", 0)
+    mem_display = f"{mem}MB" if mem < 1024 else f"{mem // 1024}GB"
+    resources = f"{int(cpu)} CPU, {mem_display}"
+    if gpu_type and gpu_count > 0:
+        gpu_label = f"{gpu_count}x {gpu_type}" if gpu_count > 1 else gpu_type
+        resources += f", {gpu_label}"
+
+    if status == "running":
+        actions = (
+            f'<a href="/sandboxes/{s["id"]}/open" class="btn btn-primary">Open</a>'
+            f' <form method="POST" action="/sandboxes/{s["id"]}/stop" style="display:inline">'
+            f'<button type="submit" class="btn btn-secondary">Stop</button></form>'
+            f' <form method="POST" action="/sandboxes/{s["id"]}/delete" style="display:inline"'
+            f' onsubmit="return confirm(\'Delete {s["name"]}? This will permanently remove its workspace.\')">'
+            f'<button type="submit" class="btn btn-danger">Delete</button></form>'
+        )
+    else:
+        actions = (
+            f'<form method="POST" action="/sandboxes/{s["id"]}/start" style="display:inline">'
+            f'<button type="submit" class="btn btn-primary">Start</button></form>'
+            f' <form method="POST" action="/sandboxes/{s["id"]}/delete" style="display:inline"'
+            f' onsubmit="return confirm(\'Delete {s["name"]}? This will permanently remove its workspace.\')">'
+            f'<button type="submit" class="btn btn-danger">Delete</button></form>'
+        )
+
+    return f"""<div class="sandbox-card">
+      <div class="sandbox-info">
+        <div class="sandbox-name">{s["name"]}</div>
+        <div class="sandbox-meta">{status_dot} {status} &middot; {resources}</div>
+      </div>
+      <div class="sandbox-actions">{actions}</div>
+    </div>"""
 
 
 def _dashboard_page(sandboxes: list[dict]) -> str:
     """Render the dashboard HTML with a list of sandboxes."""
-    rows = ""
-    for s in sandboxes:
-        status = s["status"]
-        status_dot = (
-            '<span style="color:#22c55e">&#9679;</span>'
-            if status == "running"
-            else '<span style="color:#737373">&#9679;</span>'
-        )
+    if sandboxes:
+        cards = "".join(_render_sandbox_card(s) for s in sandboxes)
+        sandbox_list = f'<div class="sandbox-list">{cards}</div>'
+    else:
+        sandbox_list = '<p style="color:#737373;text-align:center;padding:2rem 0">No sandboxes yet. Create one below.</p>'
 
-        # Resource summary
-        cpu = s.get("cpu", 4)
-        mem = s.get("memory", 8192)
-        gpu_type = s.get("gpu_type", "")
-        gpu_count = s.get("gpu_count", 0)
-        mem_display = f"{mem}MB" if mem < 1024 else f"{mem // 1024}GB"
-        resources = f"{int(cpu)} CPU, {mem_display}"
-        if gpu_type and gpu_count > 0:
-            gpu_label = f"{gpu_count}x {gpu_type}" if gpu_count > 1 else gpu_type
-            resources += f", {gpu_label}"
+    return _load_template("dashboard.html").safe_substitute(
+        pwa_head=_PWA_HEAD, sandbox_list=sandbox_list
+    )
 
-        actions = ""
-        if status == "running":
-            actions = (
-                f'<a href="/sandboxes/{s["id"]}/open" class="btn btn-primary">Open</a>'
-                f' <form method="POST" action="/sandboxes/{s["id"]}/stop" style="display:inline">'
-                f'<button type="submit" class="btn btn-secondary">Stop</button></form>'
-                f' <form method="POST" action="/sandboxes/{s["id"]}/delete" style="display:inline"'
-                f' onsubmit="return confirm(\'Delete {s["name"]}? This will permanently remove its workspace.\')">'
-                f'<button type="submit" class="btn btn-danger">Delete</button></form>'
-            )
-        else:
-            actions = (
-                f'<form method="POST" action="/sandboxes/{s["id"]}/start" style="display:inline">'
-                f'<button type="submit" class="btn btn-primary">Start</button></form>'
-                f' <form method="POST" action="/sandboxes/{s["id"]}/delete" style="display:inline"'
-                f' onsubmit="return confirm(\'Delete {s["name"]}? This will permanently remove its workspace.\')">'
-                f'<button type="submit" class="btn btn-danger">Delete</button></form>'
-            )
 
-        rows += f"""<tr>
-          <td>{s["name"]}</td>
-          <td>{status_dot} {status}</td>
-          <td style="font-size:0.8rem;color:#737373">{resources}</td>
-          <td style="font-size:0.8rem;color:#737373">{s["created_at"]}</td>
-          <td>{actions}</td>
-        </tr>"""
-
-    empty = ""
-    if not sandboxes:
-        empty = '<p style="color:#737373;text-align:center;padding:2rem 0">No sandboxes yet. Create one below.</p>'
-
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OpenPortal — Dashboard</title>
-<style>
-  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    font-family: system-ui, -apple-system, sans-serif;
-    background: #0a0a0a; color: #e5e5e5;
-    min-height: 100vh; padding: 2rem;
-  }}
-  .container {{ max-width: 720px; margin: 0 auto; }}
-  .header {{
-    display: flex; justify-content: space-between; align-items: center;
-    margin-bottom: 2rem;
-  }}
-  h1 {{ font-size: 1.25rem; }}
-  table {{ width: 100%; border-collapse: collapse; }}
-  th, td {{ padding: 0.75rem 1rem; text-align: left; }}
-  th {{
-    font-size: 0.75rem; text-transform: uppercase; color: #737373;
-    border-bottom: 1px solid #262626;
-  }}
-  tr {{ border-bottom: 1px solid #1a1a1a; }}
-  tr:hover {{ background: #171717; }}
-  .btn {{
-    display: inline-block; padding: 0.4rem 0.9rem; border-radius: 6px;
-    font-size: 0.8rem; font-weight: 600; text-decoration: none;
-    cursor: pointer; border: none;
-  }}
-  .btn-primary {{ background: #e5e5e5; color: #0a0a0a; }}
-  .btn-primary:hover {{ background: #d4d4d4; }}
-  .btn-secondary {{ background: #262626; color: #e5e5e5; }}
-  .btn-secondary:hover {{ background: #333; }}
-  .btn-danger {{ background: #7f1d1d; color: #fca5a5; }}
-  .btn-danger:hover {{ background: #991b1b; }}
-  .create-form {{
-    margin-top: 2rem; border-top: 1px solid #262626; padding-top: 1.5rem;
-  }}
-  .create-form .row {{
-    display: flex; gap: 0.75rem; margin-bottom: 0.75rem;
-  }}
-  .create-form input, .create-form select {{
-    padding: 0.6rem 1rem; border: 1px solid #333;
-    border-radius: 8px; background: #0a0a0a; color: #e5e5e5;
-    font-size: 0.9rem; outline: none;
-  }}
-  .create-form input {{ flex: 1; }}
-  .create-form input:focus, .create-form select:focus {{ border-color: #555; }}
-  .create-form label {{
-    font-size: 0.75rem; color: #737373; display: block; margin-bottom: 0.3rem;
-  }}
-  .create-form .field {{ display: flex; flex-direction: column; }}
-  .create-form .field-grow {{ flex: 1; }}
-</style>
-</head>
-<body>
-<div class="container">
-  <div class="header">
-    <h1>OpenPortal</h1>
-    <form method="POST" action="/logout">
-      <button type="submit" class="btn btn-secondary">Logout</button>
-    </form>
-  </div>
-
-  {f'<table><thead><tr><th>Name</th><th>Status</th><th>Resources</th><th>Created</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table>' if sandboxes else empty}
-
-  <form class="create-form" method="POST" action="/sandboxes">
-    <div class="row">
-      <div class="field field-grow">
-        <label>Name</label>
-        <input type="text" name="name" placeholder="New sandbox name..." required>
-      </div>
-    </div>
-    <div class="row">
-      <div class="field">
-        <label>CPU</label>
-        <select name="cpu">
-          <option value="1">1</option>
-          <option value="2">2</option>
-          <option value="4" selected>4</option>
-          <option value="8">8</option>
-          <option value="16">16</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>RAM (MB)</label>
-        <select name="memory">
-          <option value="1024">1024</option>
-          <option value="2048">2048</option>
-          <option value="4096">4096</option>
-          <option value="8192" selected>8192</option>
-          <option value="16384">16384</option>
-          <option value="32768">32768</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>GPU</label>
-        <select name="gpu_type" id="gpu_type" onchange="document.getElementById('gpu_count_field').style.display=this.value?'flex':'none'">
-          <option value="">None</option>
-          <option value="T4">T4</option>
-          <option value="L4">L4</option>
-          <option value="A10G">A10G</option>
-          <option value="L40S">L40S</option>
-          <option value="A100">A100</option>
-          <option value="H100">H100</option>
-        </select>
-      </div>
-      <div class="field" id="gpu_count_field" style="display:none">
-        <label>GPU Count</label>
-        <select name="gpu_count">
-          <option value="1" selected>1</option>
-          <option value="2">2</option>
-          <option value="4">4</option>
-        </select>
-      </div>
-    </div>
-    <div class="row">
-      <button type="submit" class="btn btn-primary">Create Sandbox</button>
-    </div>
-  </form>
-</div>
-</body>
-</html>"""
+def _render_iframe_page(name: str, tunnel_url: str) -> str:
+    """Render the iframe page for an open sandbox."""
+    return _load_template("iframe.html").safe_substitute(
+        pwa_head=_PWA_HEAD, name=name, tunnel_url=tunnel_url
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -544,9 +422,25 @@ def _dashboard_page(sandboxes: list[dict]) -> str:
 def _create_fastapi_app():
     """Build the FastAPI app with all routes."""
     from fastapi import FastAPI, Form, Request
-    from fastapi.responses import HTMLResponse, RedirectResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
     web = FastAPI()
+
+    # -- Manifest (PWA) ----------------------------------------------------
+    @web.get("/manifest.json")
+    def manifest():
+        return JSONResponse(
+            {
+                "name": "OpenPortal",
+                "short_name": "OpenPortal",
+                "start_url": "/",
+                "display": "standalone",
+                "background_color": "#0a0a0a",
+                "theme_color": "#0a0a0a",
+                "icons": [],
+            },
+            media_type="application/manifest+json",
+        )
 
     # -- Auth dependency ---------------------------------------------------
     class _AuthRedirect(Exception):
@@ -568,14 +462,12 @@ def _create_fastapi_app():
         token = request.cookies.get(COOKIE_NAME)
         if token and _check_token(token):
             return RedirectResponse("/dashboard", status_code=303)
-        return HTMLResponse(LOGIN_PAGE.replace("{error}", ""))
+        return HTMLResponse(_render_login_page())
 
     @web.post("/login")
     def login(request: Request, password: str = Form(...)):
         if not hmac.compare_digest(password, _get_password()):
-            html = LOGIN_PAGE.replace(
-                "{error}", '<p class="error">Invalid password</p>'
-            )
+            html = _render_login_page('<p class="error">Invalid password</p>')
             return HTMLResponse(html, status_code=401)
         token = _make_token(password)
         response = RedirectResponse("/dashboard", status_code=303)
@@ -611,8 +503,8 @@ def _create_fastapi_app():
     def create_sandbox(
         request: Request,
         name: str = Form(...),
-        cpu: str = Form("4"),
-        memory: str = Form("8192"),
+        cpu: str = Form("0.5"),
+        memory: str = Form("512"),
         gpu_type: str = Form(""),
         gpu_count: str = Form("1"),
     ):
@@ -641,7 +533,8 @@ def _create_fastapi_app():
         if entry:
             try:
                 sb = modal.Sandbox.from_id(entry["modal_sandbox_id"])
-                sb.terminate()
+                if sb.poll() is None:
+                    _sync_and_terminate(sb)
             except Exception:
                 pass
         return RedirectResponse("/dashboard", status_code=303)
@@ -667,21 +560,7 @@ def _create_fastapi_app():
 
         tunnel = sb.tunnels()[OPENCODE_PORT]
         name = entry.get("name", sandbox_id)
-        html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>{name} — OpenPortal</title>
-<style>
-  * {{ margin: 0; padding: 0; }}
-  html, body {{ height: 100%; overflow: hidden; }}
-  iframe {{ width: 100%; height: 100%; border: none; }}
-</style>
-</head>
-<body>
-<iframe src="{tunnel.url}" allow="clipboard-read; clipboard-write"></iframe>
-</body>
-</html>"""
+        html = _render_iframe_page(name, tunnel.url)
         return HTMLResponse(html)
 
     return web

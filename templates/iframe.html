@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+$pwa_head
+<title>$name — OpenPortal</title>
+<style>
+  * { margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: #0a0a0a; }
+  body {
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  iframe { width: 100%; height: 100%; border: none; }
+</style>
+</head>
+<body>
+<iframe src="$tunnel_url" allow="clipboard-read; clipboard-write"></iframe>
+</body>
+</html>
