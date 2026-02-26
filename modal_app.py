@@ -48,7 +48,8 @@ COOKIE_NAME = "openportal_session"
 app = modal.App(APP_NAME)
 
 # Shared persistent volume for all sandbox workspaces and the registry file.
-volume = modal.Volume.from_name("openportal-workspace", create_if_missing=True)
+# Using v2 for in-sandbox `sync` support (persists data without SDK calls).
+volume = modal.Volume.from_name("openportal-workspace-v2", create_if_missing=True, version=2)
 
 
 # ---------------------------------------------------------------------------
@@ -58,12 +59,32 @@ def _build_sandbox_image() -> modal.Image:
     """Build the container image with OpenCode installed."""
     image = (
         modal.Image.debian_slim(python_version="3.12")
-        .apt_install("curl", "unzip", "git", "ca-certificates")
+        .apt_install("curl", "unzip", "git", "ca-certificates", "gnupg")
+        # Install Node.js (LTS) via NodeSource
+        .run_commands(
+            "curl -fsSL https://deb.nodesource.com/setup_22.x | bash -",
+            "apt-get install -y nodejs",
+        )
+        # Install Bun
+        .run_commands(
+            "curl -fsSL https://bun.sh/install | bash",
+        )
+        # Install JDK (Eclipse Temurin 21)
+        .run_commands(
+            "apt-get install -y wget apt-transport-https",
+            "mkdir -p /etc/apt/keyrings",
+            "wget -O - https://packages.adoptium.net/artifactory/api/gpg/key/public | tee /etc/apt/keyrings/adoptium.asc",
+            'echo "deb [signed-by=/etc/apt/keyrings/adoptium.asc] https://packages.adoptium.net/artifactory/deb bookworm main" | tee /etc/apt/sources.list.d/adoptium.list',
+            "apt-get update",
+            "apt-get install -y temurin-21-jdk",
+        )
+        # Install OpenCode
         .run_commands("curl -fsSL https://opencode.ai/install | bash")
         .env(
             {
-                "PATH": "/root/.opencode/bin:/usr/local/bin:/usr/bin:/bin",
+                "PATH": "/root/.bun/bin:/root/.opencode/bin:/usr/local/bin:/usr/bin:/bin",
                 "HOME": "/root",
+                "JAVA_HOME": "/usr/lib/jvm/temurin-21-jdk-amd64",
             }
         )
     )
@@ -83,7 +104,7 @@ sandbox_image = _build_sandbox_image()
 
 # Proxy image — lightweight, only needs fastapi.
 proxy_image = modal.Image.debian_slim(python_version="3.12").pip_install(
-    "fastapi"
+    "fastapi", "httpx"
 ).add_local_dir(
     str(Path(__file__).parent / "templates"),
     "/root/templates",
@@ -143,19 +164,23 @@ def _make_setup_script(workspace_dir: str) -> str:
 mkdir -p {workspace_dir}/.opencode-data
 mkdir -p /root/.local/share
 ln -sfn {workspace_dir}/.opencode-data /root/.local/share/opencode
+# Share auth across all sandboxes via a single file on the volume.
+mkdir -p {VOLUME_MOUNT}/shared
+if [ ! -f {VOLUME_MOUNT}/shared/auth.json ]; then
+    echo '{{}}' > {VOLUME_MOUNT}/shared/auth.json
+fi
+ln -sf {VOLUME_MOUNT}/shared/auth.json {workspace_dir}/.opencode-data/auth.json
 if [ ! -d {workspace_dir}/.git ]; then
     git init {workspace_dir}
 fi
-# Periodically sync volume to persist data while running.
-while true; do sleep 60; sync {VOLUME_MOUNT}; done &
 exec opencode serve --hostname=0.0.0.0 --port={OPENCODE_PORT}
 """
 
 
 def _create_sandbox(
     name: str,
-    cpu: float = 0.5,
-    memory: int = 512,
+    cpu: float = 4,
+    memory: int = 4096,
     gpu_type: str = "",
     gpu_count: int = 0,
 ) -> dict:
@@ -221,13 +246,31 @@ def _get_running_sandbox(entry: dict) -> modal.Sandbox | None:
     return None
 
 
-def _sync_and_terminate(sb: modal.Sandbox) -> None:
-    """Flush volume writes and terminate a running sandbox."""
+def _snapshot_and_terminate(sb: modal.Sandbox, sandbox_id: str) -> None:
+    """Take a filesystem snapshot, save its ID, and terminate a running sandbox."""
     try:
-        sb.exec("sync", VOLUME_MOUNT)
+        snapshot_image = sb.snapshot_filesystem()
+        # Persist snapshot image ID in the registry.
+        entries = _read_registry()
+        for e in entries:
+            if e["id"] == sandbox_id:
+                e["snapshot_image_id"] = snapshot_image.object_id
+                break
+        _write_registry(entries)
     except Exception:
         pass
     sb.terminate()
+
+
+def _resolve_sandbox_image(entry: dict) -> modal.Image:
+    """Return the snapshot image if one exists, otherwise the base sandbox image."""
+    snapshot_id = entry.get("snapshot_image_id")
+    if snapshot_id:
+        try:
+            return modal.Image.from_id(snapshot_id)
+        except Exception:
+            pass
+    return sandbox_image
 
 
 def _start_sandbox(entry: dict) -> dict:
@@ -236,7 +279,9 @@ def _start_sandbox(entry: dict) -> dict:
     try:
         old_sb = modal.Sandbox.from_id(entry["modal_sandbox_id"])
         if old_sb.poll() is None:
-            _sync_and_terminate(old_sb)
+            _snapshot_and_terminate(old_sb, entry["id"])
+            # Re-read entry to pick up the snapshot_image_id just saved.
+            entry = _get_registry_entry(entry["id"]) or entry
     except Exception:
         pass
 
@@ -252,6 +297,8 @@ def _start_sandbox(entry: dict) -> dict:
     if gpu_type and gpu_count > 0:
         gpu = f"{gpu_type}:{gpu_count}" if gpu_count > 1 else gpu_type
 
+    image = _resolve_sandbox_image(entry)
+
     sb = modal.Sandbox.create(
         "bash",
         "-c",
@@ -262,7 +309,7 @@ def _start_sandbox(entry: dict) -> dict:
         cpu=cpu,
         memory=memory,
         gpu=gpu,
-        image=sandbox_image,
+        image=image,
         app=deployed_app,
         volumes={VOLUME_MOUNT: volume},
         workdir=workspace_dir,
@@ -282,11 +329,11 @@ def _start_sandbox(entry: dict) -> dict:
 
 def _delete_sandbox(entry: dict) -> None:
     """Delete a sandbox: terminate it, remove its workspace, and unregister."""
-    # Sync and terminate if still running.
+    # Terminate if still running (no snapshot needed since we're deleting).
     try:
         sb = modal.Sandbox.from_id(entry["modal_sandbox_id"])
         if sb.poll() is None:
-            _sync_and_terminate(sb)
+            sb.terminate()
     except Exception:
         pass
 
@@ -359,15 +406,7 @@ def _render_sandbox_card(s: dict) -> str:
     )
 
     # Resource summary
-    cpu = s.get("cpu", 4)
-    mem = s.get("memory", 8192)
-    gpu_type = s.get("gpu_type", "")
-    gpu_count = s.get("gpu_count", 0)
-    mem_display = f"{mem}MB" if mem < 1024 else f"{mem // 1024}GB"
-    resources = f"{int(cpu)} CPU, {mem_display}"
-    if gpu_type and gpu_count > 0:
-        gpu_label = f"{gpu_count}x {gpu_type}" if gpu_count > 1 else gpu_type
-        resources += f", {gpu_label}"
+    resources = _format_resources(s)
 
     if status == "running":
         actions = (
@@ -409,10 +448,35 @@ def _dashboard_page(sandboxes: list[dict]) -> str:
     )
 
 
-def _render_iframe_page(name: str, tunnel_url: str) -> str:
+def _format_resources(entry: dict) -> str:
+    """Format resource info as a short summary string."""
+    cpu = entry.get("cpu", 4)
+    mem = entry.get("memory", 8192)
+    gpu_type = entry.get("gpu_type", "")
+    gpu_count = entry.get("gpu_count", 0)
+    mem_display = f"{mem}MB" if mem < 1024 else f"{mem // 1024}GB"
+    resources = f"{int(cpu)} CPU, {mem_display}"
+    if gpu_type and gpu_count > 0:
+        gpu_label = f"{gpu_count}x {gpu_type}" if gpu_count > 1 else gpu_type
+        resources += f", {gpu_label}"
+    return resources
+
+
+def _render_iframe_page(
+    name: str,
+    tunnel_url: str,
+    resources: str,
+    sandbox_id: str = "",
+    dashboard_url: str = "",
+) -> str:
     """Render the iframe page for an open sandbox."""
     return _load_template("iframe.html").safe_substitute(
-        pwa_head=_PWA_HEAD, name=name, tunnel_url=tunnel_url
+        pwa_head=_PWA_HEAD,
+        name=name,
+        tunnel_url=tunnel_url,
+        resources=resources,
+        sandbox_id=sandbox_id,
+        dashboard_url=dashboard_url,
     )
 
 
@@ -426,7 +490,21 @@ def _create_fastapi_app():
 
     web = FastAPI()
 
-    # -- Manifest (PWA) ----------------------------------------------------
+    # -- Manifest & icon (PWA) ------------------------------------------------
+    _FAVICON_SVG = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+        '<circle cx="50" cy="50" r="50" fill="#0a0a0a"/>'
+        '<text x="50" y="50" text-anchor="middle" dominant-baseline="central" '
+        'font-family="system-ui,-apple-system,sans-serif" font-size="58" '
+        'font-weight="700" fill="#e5e5e5">O</text></svg>'
+    )
+
+    @web.get("/icon.svg")
+    def icon():
+        from fastapi.responses import Response
+
+        return Response(content=_FAVICON_SVG, media_type="image/svg+xml")
+
     @web.get("/manifest.json")
     def manifest():
         return JSONResponse(
@@ -437,7 +515,14 @@ def _create_fastapi_app():
                 "display": "standalone",
                 "background_color": "#0a0a0a",
                 "theme_color": "#0a0a0a",
-                "icons": [],
+                "icons": [
+                    {
+                        "src": "/icon.svg",
+                        "sizes": "any",
+                        "type": "image/svg+xml",
+                        "purpose": "any",
+                    }
+                ],
             },
             media_type="application/manifest+json",
         )
@@ -503,8 +588,8 @@ def _create_fastapi_app():
     def create_sandbox(
         request: Request,
         name: str = Form(...),
-        cpu: str = Form("0.5"),
-        memory: str = Form("512"),
+        cpu: str = Form("4"),
+        memory: str = Form("4096"),
         gpu_type: str = Form(""),
         gpu_count: str = Form("1"),
     ):
@@ -534,7 +619,7 @@ def _create_fastapi_app():
             try:
                 sb = modal.Sandbox.from_id(entry["modal_sandbox_id"])
                 if sb.poll() is None:
-                    _sync_and_terminate(sb)
+                    _snapshot_and_terminate(sb, sandbox_id)
             except Exception:
                 pass
         return RedirectResponse("/dashboard", status_code=303)
@@ -560,8 +645,135 @@ def _create_fastapi_app():
 
         tunnel = sb.tunnels()[OPENCODE_PORT]
         name = entry.get("name", sandbox_id)
-        html = _render_iframe_page(name, tunnel.url)
+        resources = _format_resources(entry)
+        dashboard_url = sb.get_dashboard_url()
+        html = _render_iframe_page(
+            name, tunnel.url, resources,
+            sandbox_id=sandbox_id,
+            dashboard_url=dashboard_url,
+        )
         return HTMLResponse(html)
+
+    @web.get("/api/sandboxes/{sandbox_id}/stats")
+    def sandbox_stats(sandbox_id: str, request: Request):
+        """Return live CPU/RAM/GPU usage for a running sandbox."""
+        token = request.cookies.get(COOKIE_NAME)
+        if not token or not _check_token(token):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        entry = _get_registry_entry(sandbox_id)
+        if not entry:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+
+        sb = _get_running_sandbox(entry)
+        if not sb:
+            return JSONResponse({"error": "Sandbox not running"}, status_code=404)
+
+        stats: dict = {}
+
+        # --- CPU: sample cgroup cpuacct over a short interval ---
+        # /proc/loadavg is unreliable in containers; use cgroup v1 cpuacct
+        try:
+            p = sb.exec(
+                "sh", "-c",
+                "cat /sys/fs/cgroup/cpuacct/cpuacct.usage; sleep 0.5; cat /sys/fs/cgroup/cpuacct/cpuacct.usage",
+            )
+            lines = "".join(p.stdout).strip().split("\n")
+            p.wait()
+            t1 = int(lines[0])
+            t2 = int(lines[1])
+            # cpuacct.usage is in nanoseconds; delta over 0.5s interval
+            delta_ns = t2 - t1
+            interval_ns = 500_000_000  # 0.5s
+            cpu_count = entry.get("cpu", 1)
+            cpu_pct = (delta_ns / interval_ns / cpu_count) * 100
+            stats["cpu_pct"] = round(min(cpu_pct, 100), 1)
+        except Exception:
+            stats["cpu_pct"] = None
+
+        # --- RAM: read cgroup memory stats (cgroup v1) ---
+        try:
+            p = sb.exec("cat", "/sys/fs/cgroup/memory/memory.usage_in_bytes")
+            mem_used_raw = "".join(p.stdout).strip()
+            p.wait()
+            mem_used = int(mem_used_raw)
+
+            p2 = sb.exec("cat", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+            mem_max_raw = "".join(p2.stdout).strip()
+            p2.wait()
+            # cgroup v1 reports a huge number when unlimited
+            mem_max = int(mem_max_raw)
+            if mem_max > 2**50:
+                mem_max = entry.get("memory", 4096) * 1024 * 1024
+
+            stats["ram_used_mb"] = round(mem_used / (1024 * 1024), 1)
+            stats["ram_max_mb"] = round(mem_max / (1024 * 1024), 1)
+            stats["ram_pct"] = round(mem_used / mem_max * 100, 1) if mem_max > 0 else 0
+        except Exception as e:
+            stats["ram_used_mb"] = None
+            stats["ram_pct"] = None
+
+        # --- GPU: nvidia-smi (only if GPU configured) ---
+        gpu_type = entry.get("gpu_type", "")
+        if gpu_type:
+            try:
+                p = sb.exec(
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                )
+                gpu_line = "".join(p.stdout).strip()
+                p.wait()
+                # Format: "42, 1234, 16384"
+                parts = [x.strip() for x in gpu_line.split(",")]
+                stats["gpu_util_pct"] = float(parts[0])
+                stats["gpu_mem_used_mb"] = float(parts[1])
+                stats["gpu_mem_total_mb"] = float(parts[2])
+            except Exception:
+                stats["gpu_util_pct"] = None
+
+        return JSONResponse(stats)
+
+    @web.post("/api/transcribe")
+    async def transcribe(request: Request):
+        import httpx
+
+        # Return 401 JSON instead of redirecting for API endpoints.
+        token = request.cookies.get(COOKIE_NAME)
+        if not token or not _check_token(token):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        form = await request.form()
+        try:
+            audio_file = form.get("file")
+            if not audio_file:
+                return JSONResponse({"error": "No audio file provided"}, status_code=400)
+
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+            if not api_key:
+                return JSONResponse(
+                    {"error": "OPENAI_API_KEY not configured"}, status_code=500
+                )
+
+            contents = await audio_file.read()
+            filename = audio_file.filename or "recording.webm"
+
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files={"file": (filename, contents, audio_file.content_type or "audio/webm")},
+                    data={"model": "whisper-1"},
+                )
+
+            if resp.status_code != 200:
+                return JSONResponse(
+                    {"error": f"OpenAI API error: {resp.text}"}, status_code=resp.status_code
+                )
+
+            return JSONResponse(resp.json())
+        finally:
+            await form.close()
 
     return web
 
@@ -571,7 +783,10 @@ def _create_fastapi_app():
 # ---------------------------------------------------------------------------
 @app.function(
     image=proxy_image,
-    secrets=[modal.Secret.from_name(PASSWORD_SECRET_NAME)],
+    secrets=[
+        modal.Secret.from_name(PASSWORD_SECRET_NAME),
+        modal.Secret.from_name("openai-secret"),
+    ],
     volumes={VOLUME_MOUNT: volume},
     scaledown_window=300,
     timeout=300,
